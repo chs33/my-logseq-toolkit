@@ -1,0 +1,32 @@
+{
+  "name": "my-logseq-toolkit",
+  "version": "1.0.0",
+  "private": true,
+  "title": "My Logseq Toolkit",
+  "description": "A growing collection of tools for Logseq, including a block-aware local graph and references panel.",
+  "main": "dist/index.html",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "logseq": {
+    "id": "my-logseq-toolkit",
+    "icon": "icon.svg"
+  },
+  "dependencies": {
+    "@logseq/libs": "^0.3.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.24",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.5.2",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.3",
+    "vitest": "^3.2.4"
+  }
+}
