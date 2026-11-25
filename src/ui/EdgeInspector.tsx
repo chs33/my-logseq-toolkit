@@ -1,4 +1,5 @@
-import type { GraphModel } from "../core/types";
+import { memo, useMemo } from "react";
+import type { GraphModel, VisualEdge } from "../core/types";
 import type { InteractionFocus } from "./interaction";
 
 const LABELS = {
@@ -8,12 +9,17 @@ const LABELS = {
   external_url: "external URLs"
 } as const;
 
-export function EdgeInspector({ model, focus }: { model: GraphModel; focus: InteractionFocus }) {
+export const EdgeInspector = memo(function EdgeInspector({ model, focus }: { model: GraphModel; focus: InteractionFocus }) {
+  const edgeByOccurrence = useMemo(() => {
+    const index = new Map<string, VisualEdge>();
+    for (const edge of model.edges.values()) {
+      for (const item of edge.actualOccurrences) index.set(item.occurrence.id, edge);
+    }
+    return index;
+  }, [model]);
   let edge = focus.edgeId ? model.edges.get(focus.edgeId) : undefined;
   if (!edge && focus.occurrenceId) {
-    edge = [...model.edges.values()].find((candidate) =>
-      candidate.actualOccurrences.some((item) => item.occurrence.id === focus.occurrenceId)
-    );
+    edge = edgeByOccurrence.get(focus.occurrenceId);
   }
   if (!edge) return null;
   const a = model.nodes.get(edge.nodeA);
@@ -34,4 +40,4 @@ export function EdgeInspector({ model, focus }: { model: GraphModel; focus: Inte
       )}
     </div>
   );
-}
+});

@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -6,9 +7,10 @@ import {
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent
 } from "react";
-import type { GraphModel, GraphNode, VisualEdge } from "../core/types";
+import type { GraphModel, GraphNode } from "../core/types";
 import type { GraphDisplaySettings, GraphForceSettings } from "./graphSettings";
-import type { InteractionFocus } from "./interaction";
+import { isSameFocus, type InteractionFocus } from "./interaction";
+import { CanvasRenderer } from "./canvasRenderer";
 
 interface Point { x: number; y: number }
 interface Transform extends Point { scale: number }
@@ -52,31 +54,7 @@ function seedPositions(nodes: GraphNode[]): Float32Array {
   return positions;
 }
 
-function lineDistance(point: Point, a: Point, b: Point): number {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const lengthSquared = dx * dx + dy * dy;
-  if (lengthSquared === 0) return Math.hypot(point.x - a.x, point.y - a.y);
-  const t = Math.max(0, Math.min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared));
-  return Math.hypot(point.x - (a.x + t * dx), point.y - (a.y + t * dy));
-}
-
-function drawArrow(
-  context: CanvasRenderingContext2D,
-  from: Point,
-  to: Point,
-  size: number
-) {
-  const angle = Math.atan2(to.y - from.y, to.x - from.x);
-  context.beginPath();
-  context.moveTo(to.x, to.y);
-  context.lineTo(to.x - Math.cos(angle - 0.48) * size, to.y - Math.sin(angle - 0.48) * size);
-  context.lineTo(to.x - Math.cos(angle + 0.48) * size, to.y - Math.sin(angle + 0.48) * size);
-  context.closePath();
-  context.fill();
-}
-
-export function GraphCanvas({
+export const GraphCanvas = memo(function GraphCanvas({
   model,
   focus,
   fitToken,
@@ -91,11 +69,18 @@ export function GraphCanvas({
   const transformRef = useRef<Transform>({ x: 0, y: 0, scale: 1 });
   const gestureRef = useRef<Gesture | null>(null);
   const frameRef = useRef<number | null>(null);
+  const frameWindowRef = useRef<Window | null>(null);
   const drawRef = useRef<() => void>(() => undefined);
   const focusRef = useRef(focus);
   const displayRef = useRef(display);
   const forcesRef = useRef(forces);
   const didAutoFit = useRef(false);
+  const viewportRef = useRef({ width: 0, height: 0, ratio: 1 });
+  const geometryDirty = useRef(true);
+  const pendingHover = useRef<Point | null>(null);
+  const pendingPin = useRef<{ type: "pin"; index: number; x: number; y: number; pinned: boolean } | null>(null);
+  const hoverRef = useRef<(point: Point) => boolean>(() => false);
+  const needsDraw = useRef(false);
 
   const nodes = useMemo(() => [...model.nodes.values()], [model]);
   const edges = useMemo(() => [...model.edges.values()], [model]);
@@ -106,15 +91,36 @@ export function GraphCanvas({
     target: nodeIndex.get(edge.nodeB)!
   })).filter((edge) => edge.source !== undefined && edge.target !== undefined), [edges, nodeIndex]);
 
+  const renderer = useMemo(() => new CanvasRenderer(nodes, indexedEdges), [nodes, indexedEdges]);
+  const rendererRef = useRef(renderer);
+  if (rendererRef.current !== renderer) {
+    rendererRef.current = renderer;
+    geometryDirty.current = true;
+  }
+
   focusRef.current = focus;
   displayRef.current = display;
   forcesRef.current = forces;
 
-  const requestDraw = useCallback(() => {
+  const requestDraw = useCallback((draw = true) => {
+    needsDraw.current ||= draw;
     if (frameRef.current !== null) return;
-    frameRef.current = requestAnimationFrame(() => {
+    // The canvas lives in Logseq's document; our plugin iframe stays hidden.
+    const view = canvasRef.current?.ownerDocument.defaultView;
+    if (!view) return;
+    frameWindowRef.current = view;
+    frameRef.current = view.requestAnimationFrame(() => {
       frameRef.current = null;
-      drawRef.current();
+      if (pendingPin.current) {
+        workerRef.current?.postMessage(pendingPin.current);
+        pendingPin.current = null;
+      }
+      if (pendingHover.current) {
+        needsDraw.current = hoverRef.current(pendingHover.current) || needsDraw.current;
+        pendingHover.current = null;
+      }
+      if (needsDraw.current) drawRef.current();
+      needsDraw.current = false;
     });
   }, []);
 
@@ -142,131 +148,48 @@ export function GraphCanvas({
       x: width / 2 - ((minX + maxX) / 2) * scale,
       y: height / 2 - ((minY + maxY) / 2) * scale
     };
+    geometryDirty.current = true;
     requestDraw();
   }, [requestDraw]);
+
+  const ensureGeometry = () => {
+    if (!geometryDirty.current) return;
+    const { width, height } = viewportRef.current;
+    renderer.geometry.update(positionsRef.current, transformRef.current, width, height);
+    geometryDirty.current = false;
+  };
 
   drawRef.current = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const context = canvas.getContext("2d");
     if (!context) return;
-    const ratio = Math.min(2, window.devicePixelRatio || 1);
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
-    context.setTransform(ratio, 0, 0, ratio, 0, 0);
-    context.clearRect(0, 0, width, height);
-
-    const transform = transformRef.current;
-    const positions = positionsRef.current;
-    const activeFocus = focusRef.current;
-    const activeDisplay = displayRef.current;
-    const hasFocus = Boolean(activeFocus.nodeId || activeFocus.edgeId || activeFocus.occurrenceId);
-    const occurrenceEdge = activeFocus.occurrenceId
-      ? edges.find((edge) => edge.actualOccurrences.some((item) => item.occurrence.id === activeFocus.occurrenceId))?.id
-      : undefined;
-    const activeEdgeIds = new Set<string>();
-    const activeNodeIds = new Set<string>();
-    if (activeFocus.nodeId) activeNodeIds.add(activeFocus.nodeId);
-    for (const edge of edges) {
-      if (
-        activeFocus.edgeId === edge.id || occurrenceEdge === edge.id ||
-        Boolean(activeFocus.nodeId && (edge.nodeA === activeFocus.nodeId || edge.nodeB === activeFocus.nodeId))
-      ) {
-        activeEdgeIds.add(edge.id);
-        activeNodeIds.add(edge.nodeA);
-        activeNodeIds.add(edge.nodeB);
-      }
-    }
-
-    context.save();
-    context.translate(transform.x, transform.y);
-    context.scale(transform.scale, transform.scale);
-    context.lineCap = "round";
-
-    for (const { edge, source, target } of indexedEdges) {
-      const a = { x: positions[source * 2], y: positions[source * 2 + 1] };
-      const b = { x: positions[target * 2], y: positions[target * 2 + 1] };
-      const active = activeEdgeIds.has(edge.id);
-      const dimmed = hasFocus && !active;
-      const color = edge.suggested ? "178, 152, 255" : active ? "126, 156, 255" : "137, 147, 164";
-      context.strokeStyle = `rgba(${color}, ${dimmed ? 0.06 : active ? 0.95 : edge.suggested ? 0.58 : 0.34})`;
-      context.fillStyle = context.strokeStyle;
-      context.lineWidth = (active ? activeDisplay.linkThickness * 1.9 : activeDisplay.linkThickness) / transform.scale;
-      context.setLineDash(edge.suggested ? [5 / transform.scale, 5 / transform.scale] : []);
-      context.beginPath();
-      context.moveTo(a.x, a.y);
-      context.lineTo(b.x, b.y);
-      context.stroke();
-
-      if (activeDisplay.arrows && !dimmed) {
-        const radiusA = (nodes[source].isCenter ? 7 : activeDisplay.nodeSize) / transform.scale;
-        const radiusB = (nodes[target].isCenter ? 7 : activeDisplay.nodeSize) / transform.scale;
-        const length = Math.max(1, Math.hypot(b.x - a.x, b.y - a.y));
-        const ux = (b.x - a.x) / length;
-        const uy = (b.y - a.y) / length;
-        const size = 5.5 / transform.scale;
-        if (edge.suggested || edge.countsByDirection.aToB > 0) {
-          drawArrow(context, a, { x: b.x - ux * (radiusB + 3 / transform.scale), y: b.y - uy * (radiusB + 3 / transform.scale) }, size);
-        }
-        if (!edge.suggested && edge.countsByDirection.bToA > 0) {
-          drawArrow(context, b, { x: a.x + ux * (radiusA + 3 / transform.scale), y: a.y + uy * (radiusA + 3 / transform.scale) }, size);
-        }
-      }
-    }
-    context.setLineDash([]);
-
-    const labelScale = 0.32 + activeDisplay.textFadeThreshold * 0.95;
-    for (let index = 0; index < nodes.length; index += 1) {
-      const node = nodes[index];
-      const point = { x: positions[index * 2], y: positions[index * 2 + 1] };
-      const active = activeNodeIds.has(node.id);
-      const dimmed = hasFocus && !active;
-      const baseRadius = node.isCenter ? 7 : node.kind === "url" ? activeDisplay.nodeSize * 0.9 : activeDisplay.nodeSize;
-      const radius = (baseRadius + (active ? 2 : 0)) / transform.scale;
-      let color = "#aeb6c4";
-      if (node.isCenter) color = "#8fa5ff";
-      else if (node.suggestedOnly) color = "#b298ff";
-      else if (node.kind === "url") color = "#69a9d8";
-      context.globalAlpha = dimmed ? 0.12 : 1;
-      context.fillStyle = color;
-      context.beginPath();
-      context.arc(point.x, point.y, radius, 0, Math.PI * 2);
-      context.fill();
-      if (active) {
-        context.strokeStyle = "rgba(185, 201, 255, .8)";
-        context.lineWidth = 1.5 / transform.scale;
-        context.beginPath();
-        context.arc(point.x, point.y, radius + 3 / transform.scale, 0, Math.PI * 2);
-        context.stroke();
-      }
-
-      const showLabel = node.isCenter || active || transform.scale >= labelScale;
-      if (showLabel) {
-        const fontSize = (node.isCenter ? 12 : 10.5) / transform.scale;
-        context.font = `${node.isCenter ? 600 : 450} ${fontSize}px Inter, system-ui, sans-serif`;
-        context.textAlign = "center";
-        context.textBaseline = "top";
-        context.lineWidth = 3 / transform.scale;
-        context.strokeStyle = "rgba(20, 22, 27, .88)";
-        context.fillStyle = node.isCenter ? "#eef1f7" : "#c7ccd5";
-        const label = node.label.length > 44 ? `${node.label.slice(0, 42)}…` : node.label;
-        context.strokeText(label, point.x, point.y + radius + 5 / transform.scale);
-        context.fillText(label, point.x, point.y + radius + 5 / transform.scale);
-      }
-      context.globalAlpha = 1;
-    }
-    context.restore();
+    const { width, height, ratio } = viewportRef.current;
+    if (width === 0 || height === 0) return;
+    ensureGeometry();
+    renderer.draw(context, width, height, ratio, transformRef.current, displayRef.current, focusRef.current);
   };
 
   useEffect(() => {
     positionsRef.current = seedPositions(nodes);
+    geometryDirty.current = true;
+    pendingHover.current = null;
+    pendingPin.current = null;
+    gestureRef.current = null;
     transformRef.current = { x: 0, y: 0, scale: 1 };
     didAutoFit.current = false;
     const worker = new Worker(new URL("./layoutWorker.ts", import.meta.url), { type: "module" });
     workerRef.current = worker;
     worker.onmessage = (event: MessageEvent<{ type: "positions"; positions: Float32Array }>) => {
       if (event.data.type !== "positions") return;
+      const gesture = gestureRef.current;
+      if (gesture?.mode === "node" && gesture.nodeIndex !== undefined && gesture.moved) {
+        // An older worker snapshot must not move the node away from the pointer.
+        event.data.positions[gesture.nodeIndex * 2] = positionsRef.current[gesture.nodeIndex * 2];
+        event.data.positions[gesture.nodeIndex * 2 + 1] = positionsRef.current[gesture.nodeIndex * 2 + 1];
+      }
       positionsRef.current = event.data.positions;
+      geometryDirty.current = true;
       if (!didAutoFit.current) {
         didAutoFit.current = true;
         fit();
@@ -301,16 +224,26 @@ export function GraphCanvas({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    let previousWidth = canvas.clientWidth;
+    let previousHeight = canvas.clientHeight;
     const resize = () => {
-      const ratio = Math.min(2, window.devicePixelRatio || 1);
+      const ratio = Math.min(2, canvas.ownerDocument.defaultView?.devicePixelRatio || 1);
       const width = Math.max(1, canvas.clientWidth);
       const height = Math.max(1, canvas.clientHeight);
+      viewportRef.current = { width, height, ratio };
+      geometryDirty.current = true;
       if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
         canvas.width = Math.round(width * ratio);
         canvas.height = Math.round(height * ratio);
       }
       if (transformRef.current.x === 0 && transformRef.current.y === 0) fit();
-      else requestDraw();
+      else {
+        transformRef.current.x += (width - previousWidth) / 2;
+        transformRef.current.y += (height - previousHeight) / 2;
+        requestDraw();
+      }
+      previousWidth = width;
+      previousHeight = height;
     };
     const observer = new ResizeObserver(resize);
     observer.observe(canvas);
@@ -320,7 +253,7 @@ export function GraphCanvas({
 
   useEffect(() => () => {
     if (frameRef.current !== null) {
-      cancelAnimationFrame(frameRef.current);
+      frameWindowRef.current?.cancelAnimationFrame(frameRef.current);
       frameRef.current = null;
     }
   }, []);
@@ -335,46 +268,29 @@ export function GraphCanvas({
     return { x: (point.x - transform.x) / transform.scale, y: (point.y - transform.y) / transform.scale };
   };
 
-  const hitNode = (screen: Point): number | undefined => {
-    const world = worldPoint(screen);
-    const positions = positionsRef.current;
-    const threshold = Math.max(8, displayRef.current.nodeSize + 4) / transformRef.current.scale;
-    let best: number | undefined;
-    let bestDistance = threshold;
-    for (let index = 0; index < nodes.length; index += 1) {
-      const distance = Math.hypot(world.x - positions[index * 2], world.y - positions[index * 2 + 1]);
-      if (distance < bestDistance) {
-        best = index;
-        bestDistance = distance;
-      }
-    }
-    return best;
+  const hitNode = (point: Point): number | undefined => {
+    ensureGeometry();
+    return renderer.geometry.hitNode(point.x, point.y, Math.max(8, displayRef.current.nodeSize + 4));
   };
 
-  const hitEdge = (screen: Point): VisualEdge | undefined => {
-    const transform = transformRef.current;
-    const positions = positionsRef.current;
-    let best: VisualEdge | undefined;
-    let bestDistance = 6;
-    for (const { edge, source, target } of indexedEdges) {
-      const a = {
-        x: positions[source * 2] * transform.scale + transform.x,
-        y: positions[source * 2 + 1] * transform.scale + transform.y
-      };
-      const b = {
-        x: positions[target * 2] * transform.scale + transform.x,
-        y: positions[target * 2 + 1] * transform.scale + transform.y
-      };
-      const distance = lineDistance(screen, a, b);
-      if (distance < bestDistance) {
-        best = edge;
-        bestDistance = distance;
-      }
-    }
-    return best;
+  const emitFocus = (next: InteractionFocus) => {
+    if (isSameFocus(focusRef.current, next)) return false;
+    focusRef.current = next;
+    onFocus(next);
+    return true;
+  };
+
+  hoverRef.current = (point) => {
+    const index = hitNode(point);
+    const edgeIndex = index === undefined ? renderer.geometry.hitEdge(point.x, point.y) : undefined;
+    const edge = edgeIndex === undefined ? undefined : indexedEdges[edgeIndex].edge;
+    const changed = emitFocus(index !== undefined ? { nodeId: nodes[index].id } : edge ? { edgeId: edge.id } : {});
+    if (canvasRef.current) canvasRef.current.style.cursor = index !== undefined || edge ? "pointer" : "grab";
+    return changed;
   };
 
   const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    pendingHover.current = null;
     const point = localPoint(event);
     const index = hitNode(point);
     if (index !== undefined) {
@@ -414,30 +330,24 @@ export function GraphCanvas({
         const worldY = gesture.origin.y + dy / transformRef.current.scale;
         positionsRef.current[gesture.nodeIndex * 2] = worldX;
         positionsRef.current[gesture.nodeIndex * 2 + 1] = worldY;
-        workerRef.current?.postMessage({
+        pendingPin.current = {
           type: "pin",
           index: gesture.nodeIndex,
           x: worldX,
           y: worldY,
           pinned: true
-        });
+        };
       }
+      geometryDirty.current = true;
       requestDraw();
       return;
     }
 
-    const index = hitNode(point);
-    if (index !== undefined) {
-      onFocus({ nodeId: nodes[index].id });
-      event.currentTarget.style.cursor = "pointer";
-      return;
-    }
-    const edge = hitEdge(point);
-    onFocus(edge ? { edgeId: edge.id } : {});
-    event.currentTarget.style.cursor = edge ? "pointer" : "grab";
+    pendingHover.current = point;
+    requestDraw(false);
   };
 
-  const pointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+  const pointerUp = (event: ReactPointerEvent<HTMLCanvasElement>, cancelled = false) => {
     const gesture = gestureRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) return;
     if (gesture.mode === "node" && gesture.nodeIndex !== undefined) {
@@ -450,10 +360,11 @@ export function GraphCanvas({
         y: positions[index * 2 + 1],
         pinned: false
       });
-      if (!gesture.moved) onNodeClick(nodes[index]);
+      pendingPin.current = null;
+      if (!cancelled && !gesture.moved) onNodeClick(nodes[index]);
     }
-    event.currentTarget.releasePointerCapture(event.pointerId);
     gestureRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
 
   const wheel = (event: ReactWheelEvent<HTMLCanvasElement>) => {
@@ -467,6 +378,8 @@ export function GraphCanvas({
       x: point.x - world.x * scale,
       y: point.y - world.y * scale
     };
+    geometryDirty.current = true;
+    pendingHover.current = null;
     requestDraw();
   };
 
@@ -476,12 +389,16 @@ export function GraphCanvas({
       className="lg-canvas"
       onPointerDown={pointerDown}
       onPointerMove={pointerMove}
-      onPointerUp={pointerUp}
-      onPointerCancel={pointerUp}
-      onPointerLeave={() => { if (!gestureRef.current) onFocus({}); }}
+      onPointerUp={(event) => pointerUp(event)}
+      onPointerCancel={(event) => pointerUp(event, true)}
+      onLostPointerCapture={(event) => pointerUp(event, true)}
+      onPointerLeave={() => {
+        pendingHover.current = null;
+        if (!gestureRef.current) { emitFocus({}); requestDraw(); }
+      }}
       onWheel={wheel}
       role="img"
       aria-label={`Local relationship graph with ${nodes.length} nodes and ${edges.length} connections`}
     />
   );
-}
+});

@@ -30,9 +30,25 @@ let x = new Float32Array();
 let y = new Float32Array();
 let vx = new Float32Array();
 let vy = new Float32Array();
+let ax = new Float32Array();
+let ay = new Float32Array();
 let pinned = new Uint8Array();
+let edgeDistanceOffsets = new Float64Array();
+let cellX = new Float64Array();
+let cellY = new Float64Array();
+let gridX = new Float64Array();
+let gridY = new Float64Array();
+let gridHead = new Int32Array();
+let gridTail = new Int32Array();
+let nextInCell = new Int32Array();
+let gridMask = 0;
 let iteration = 0;
-let generation = 0;
+let pendingRun: ReturnType<typeof setTimeout> | null = null;
+let lastEmission = -Infinity;
+
+const FRAME_INTERVAL_MS = 1000 / 60;
+const BATCH_BUDGET_MS = 8;
+const MAX_ITERATIONS = 360;
 
 function initialize() {
   const counts = new Map<number, number>();
@@ -42,7 +58,21 @@ function initialize() {
   y = new Float32Array(nodes.length);
   vx = new Float32Array(nodes.length);
   vy = new Float32Array(nodes.length);
+  ax = new Float32Array(nodes.length);
+  ay = new Float32Array(nodes.length);
   pinned = new Uint8Array(nodes.length);
+  edgeDistanceOffsets = Float64Array.from(edges, edge => Math.min(24, Math.log2(edge.weight + 1) * 5));
+  cellX = new Float64Array(nodes.length);
+  cellY = new Float64Array(nodes.length);
+  nextInCell = new Int32Array(nodes.length);
+  // Keep the hash table below half full, including when every node has its own cell.
+  let capacity = 1;
+  while (capacity < nodes.length * 2) capacity *= 2;
+  gridMask = capacity - 1;
+  gridX = new Float64Array(capacity);
+  gridY = new Float64Array(capacity);
+  gridHead = new Int32Array(capacity);
+  gridTail = new Int32Array(capacity);
   nodes.forEach((node, index) => {
     if (node.isCenter) return;
     const ordinal = seen.get(node.depth) ?? 0;
@@ -54,24 +84,32 @@ function initialize() {
     y[index] = Math.sin(angle) * radius;
   });
   iteration = 0;
+  lastEmission = -Infinity;
+}
+
+function gridSlot(cx: number, cy: number): number {
+  let slot = (Math.imul(cx, 73856093) ^ Math.imul(cy, 19349663)) & gridMask;
+  while (gridHead[slot] !== -1 && (gridX[slot] !== cx || gridY[slot] !== cy)) {
+    slot = (slot + 1) & gridMask;
+  }
+  return slot;
 }
 
 function simulateTick(alpha: number) {
-  const ax = new Float32Array(nodes.length);
-  const ay = new Float32Array(nodes.length);
   const centerStrength = settings.centerForce * 0.0013 * alpha;
   for (let index = 0; index < nodes.length; index += 1) {
-    ax[index] -= x[index] * centerStrength;
-    ay[index] -= y[index] * centerStrength;
+    ax[index] = -x[index] * centerStrength;
+    ay[index] = -y[index] * centerStrength;
   }
 
   const desired = settings.linkDistance;
   const spring = settings.linkForce * 0.011 * alpha;
-  for (const edge of edges) {
+  for (let edgeIndex = 0; edgeIndex < edges.length; edgeIndex += 1) {
+    const edge = edges[edgeIndex];
     const dx = x[edge.target] - x[edge.source];
     const dy = y[edge.target] - y[edge.source];
     const distance = Math.max(1, Math.hypot(dx, dy));
-    const weightedDesired = desired + Math.min(24, Math.log2(edge.weight + 1) * 5);
+    const weightedDesired = desired + edgeDistanceOffsets[edgeIndex];
     const force = (distance - weightedDesired) * spring;
     const fx = (dx / distance) * force;
     const fy = (dy / distance) * force;
@@ -83,29 +121,38 @@ function simulateTick(alpha: number) {
 
   // A uniform grid keeps collision/repulsion close to O(n) for local graphs.
   const cellSize = Math.max(36, desired * 0.62);
-  const grid = new Map<string, number[]>();
+  gridHead.fill(-1);
+  nextInCell.fill(-1);
   for (let index = 0; index < nodes.length; index += 1) {
     const cx = Math.floor(x[index] / cellSize);
     const cy = Math.floor(y[index] / cellSize);
-    const key = `${cx}:${cy}`;
-    const cell = grid.get(key) ?? [];
-    cell.push(index);
-    grid.set(key, cell);
+    cellX[index] = cx;
+    cellY[index] = cy;
+    const slot = gridSlot(cx, cy);
+    if (gridHead[slot] === -1) {
+      gridX[slot] = cx;
+      gridY[slot] = cy;
+      gridHead[slot] = index;
+    } else {
+      nextInCell[gridTail[slot]] = index;
+    }
+    // Append in node order so floating-point force accumulation remains stable.
+    gridTail[slot] = index;
   }
   const repelRange = cellSize * 1.85;
+  const repelRangeSquared = repelRange * repelRange;
   for (let index = 0; index < nodes.length; index += 1) {
-    const cx = Math.floor(x[index] / cellSize);
-    const cy = Math.floor(y[index] / cellSize);
+    const cx = cellX[index];
+    const cy = cellY[index];
     for (let ox = -2; ox <= 2; ox += 1) {
       for (let oy = -2; oy <= 2; oy += 1) {
-        const cell = grid.get(`${cx + ox}:${cy + oy}`);
-        if (!cell) continue;
-        for (const other of cell) {
+        const slot = gridSlot(cx + ox, cy + oy);
+        for (let other = gridHead[slot]; other !== -1; other = nextInCell[other]) {
           if (other <= index) continue;
           let dx = x[other] - x[index];
           let dy = y[other] - y[index];
+          if (dx * dx + dy * dy > repelRangeSquared) continue;
           let distance = Math.hypot(dx, dy);
-          if (distance > repelRange) continue;
           if (distance < 0.1) {
             dx = ((index * 17 + other * 31) % 11 - 5) * 0.1;
             dy = ((index * 29 + other * 13) % 11 - 5) * 0.1;
@@ -145,34 +192,50 @@ function emitPositions() {
   self.postMessage({ type: "positions", positions }, { transfer: [positions.buffer] });
 }
 
-function run(localGeneration: number) {
-  if (localGeneration !== generation) return;
+function scheduleRun() {
+  // Settings and drag events update the current simulation; a burst needs only one batch.
+  if (pendingRun === null) pendingRun = setTimeout(run, 0);
+}
+
+function run() {
+  pendingRun = null;
+  const started = performance.now();
   const batchSize = nodes.length > 900 ? 2 : nodes.length > 350 ? 3 : 5;
-  for (let batch = 0; batch < batchSize; batch += 1) {
+  for (let batch = 0; batch < batchSize && iteration < MAX_ITERATIONS; batch += 1) {
     const alpha = Math.max(0.035, Math.pow(0.986, iteration));
     simulateTick(alpha);
     iteration += 1;
+    // Yield between ticks so new drag coordinates/settings are handled promptly.
+    if (performance.now() - started >= BATCH_BUDGET_MS) break;
   }
-  emitPositions();
-  if (iteration < 360) setTimeout(() => run(localGeneration), 0);
+  const now = performance.now();
+  if (now - lastEmission >= FRAME_INTERVAL_MS || iteration >= MAX_ITERATIONS) {
+    emitPositions();
+    lastEmission = now;
+  }
+  if (iteration < MAX_ITERATIONS) scheduleRun();
 }
 
 self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const message = event.data;
   if (message.type === "init") {
-    generation += 1;
+    if (pendingRun !== null) clearTimeout(pendingRun);
+    pendingRun = null;
     nodes = message.nodes;
     edges = message.edges;
     settings = message.settings;
     initialize();
-    run(generation);
+    if (nodes.length === 0) emitPositions();
+    else scheduleRun();
     return;
   }
   if (message.type === "settings") {
-    settings = message.settings;
+    const next = message.settings;
+    if (settings.centerForce === next.centerForce && settings.repelForce === next.repelForce
+      && settings.linkForce === next.linkForce && settings.linkDistance === next.linkDistance) return;
+    settings = next;
     iteration = Math.min(iteration, 95);
-    generation += 1;
-    run(generation);
+    if (nodes.length > 0) scheduleRun();
     return;
   }
   if (message.type === "pin" && message.index >= 0 && message.index < nodes.length) {
@@ -180,8 +243,7 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
     y[message.index] = message.y;
     pinned[message.index] = message.pinned ? 1 : 0;
     iteration = Math.min(iteration, 130);
-    generation += 1;
-    run(generation);
+    scheduleRun();
   }
 };
 

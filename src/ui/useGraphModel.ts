@@ -63,6 +63,7 @@ export function useGraphModel(filters: GraphFilters, showSuggestions: boolean): 
         if (request.current === currentRequest) setLoading(false);
       }
     })();
+    return () => { request.current += 1; };
   }, [filters, showSuggestions, revision]);
 
   return { model, loading, error, refresh };

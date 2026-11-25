@@ -1,0 +1,81 @@
+name: Release plugin
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Finish each release in order, including when several pushes arrive together.
+concurrency:
+  group: release-plugin
+  queue: max
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the pushed commit
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Set release version
+        id: version
+        shell: bash
+        run: |
+          version="$(node <<'NODE'
+          const { version } = require('./package.json');
+          if (!/^\d+\.\d+\.\d+$/.test(version)) {
+            throw new Error('package.json version must use major.minor.patch');
+          }
+          const [major, minor, patch] = version.split('.').map(Number);
+          console.log(`${major}.${minor}.${patch + Number(process.env.GITHUB_RUN_NUMBER)}`);
+          NODE
+          )"
+          npm version "$version" --no-git-tag-version --ignore-scripts
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Package plugin
+        run: |
+          zip -r my-logseq-toolkit.zip dist package.json icon.svg README.md LICENSE
+          unzip -t my-logseq-toolkit.zip
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="v$RELEASE_VERSION"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release $tag already exists; keeping the published release."
+          else
+            gh release create "$tag" my-logseq-toolkit.zip \
+              --target "$GITHUB_SHA" \
+              --title "My Logseq Toolkit $tag" \
+              --generate-notes \
+              --latest
+          fi

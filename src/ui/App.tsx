@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { DEFAULT_FILTERS, type GraphFilters } from "../core/types";
 import { navigateNode, navigateOccurrence } from "../logseq/navigation";
 import { Controls } from "./Controls";
 import { EdgeInspector } from "./EdgeInspector";
 import { GraphCanvas } from "./GraphCanvas";
-import { EMPTY_FOCUS, type InteractionFocus } from "./interaction";
+import { EMPTY_FOCUS, isSameFocus, type InteractionFocus } from "./interaction";
 import { ReferencesPanel } from "./ReferencesPanel";
 import { useGraphModel } from "./useGraphModel";
 import {
@@ -25,12 +25,14 @@ export function App() {
   const [fitToken, setFitToken] = useState(0);
   const { model, loading, error, refresh } = useGraphModel(filters, showSuggestions);
 
-  useEffect(() => setFocus({}), [model]);
+  const handleFocus = useCallback((next: InteractionFocus) => {
+    setFocus((current) => isSameFocus(current, next) ? current : next);
+  }, []);
 
-  const close = () => logseq.hideMainUI({ restoreEditingCursor: true });
+  useEffect(() => handleFocus(EMPTY_FOCUS), [model, handleFocus]);
 
   return (
-    <div className="lg-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
+    <div className="lg-workspace">
       <main className="lg-shell">
         <header className="lg-header">
           <div className="lg-title-wrap">
@@ -44,7 +46,6 @@ export function App() {
             <button type="button" className={showReferences ? "is-active" : ""} onClick={() => setShowReferences((value) => !value)} title="Toggle references" aria-label="Toggle references">≡</button>
             <button type="button" className={showSettings ? "is-active" : ""} onClick={() => setShowSettings((value) => !value)} title="Graph settings" aria-label="Graph settings">⚙</button>
             <button type="button" onClick={refresh} title="Refresh graph" aria-label="Refresh graph">↻</button>
-            <button type="button" onClick={close} aria-label="Close">×</button>
           </div>
         </header>
         <div className={`lg-content ${showReferences ? "" : "references-hidden"}`}>
@@ -58,7 +59,7 @@ export function App() {
             )}
             {model && (
               <>
-                <GraphCanvas model={model} focus={focus} fitToken={fitToken} display={display} forces={forces} onFocus={setFocus} onNodeClick={(node) => void navigateNode(node)} />
+                <GraphCanvas model={model} focus={focus} fitToken={fitToken} display={display} forces={forces} onFocus={handleFocus} onNodeClick={navigateNode} />
                 <Controls
                   open={showSettings}
                   filters={filters}
@@ -81,7 +82,7 @@ export function App() {
             )}
           </section>
           {showReferences && model ? (
-            <ReferencesPanel model={model} focus={focus} onFocus={setFocus} onNavigate={(item, direction) => void navigateOccurrence(item, direction)} />
+            <ReferencesPanel model={model} focus={focus} onFocus={handleFocus} onNavigate={navigateOccurrence} />
           ) : showReferences ? (
             <aside className="lg-references"><div className="lg-references-heading"><span>References</span></div></aside>
           ) : null}

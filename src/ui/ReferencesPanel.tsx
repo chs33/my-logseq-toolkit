@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
-import type { GraphModel, ProjectedOccurrence, VisualEdge } from "../core/types";
-import type { InteractionFocus } from "./interaction";
+import { memo, useEffect, useMemo, useState } from "react";
+import type { GraphModel, ProjectedOccurrence, SuggestedRelationship, VisualEdge } from "../core/types";
+import { EMPTY_FOCUS, type InteractionFocus } from "./interaction";
 
 interface ReferencesPanelProps {
   model: GraphModel;
@@ -28,8 +28,50 @@ function neighborFor(model: GraphModel, item: ProjectedOccurrence): string {
   return source.depth <= target.depth ? target.label : source.label;
 }
 
-function ReferenceSection({
+const ReferenceRow = memo(function ReferenceRow({ item, edgeId, direction, active, onFocus, onNavigate }: {
+  item: ProjectedOccurrence;
+  edgeId?: string;
+  direction: "outgoing" | "incoming";
+  active: boolean;
+  onFocus: ReferencesPanelProps["onFocus"];
+  onNavigate: ReferencesPanelProps["onNavigate"];
+}) {
+  return (
+    <button
+      type="button"
+      className={`lg-reference ${active ? "is-active" : ""}`}
+      onMouseEnter={() => onFocus({ occurrenceId: item.occurrence.id, edgeId })}
+      onMouseLeave={() => onFocus(EMPTY_FOCUS)}
+      onClick={() => onNavigate(item, direction)}
+    >
+      <span className={`lg-relation-badge is-${item.occurrence.kind}`}>{TYPE_LABEL[item.occurrence.kind]}</span>
+      <span className="lg-reference-context">{item.occurrence.sourceContext || "Open exact occurrence"}</span>
+    </button>
+  );
+});
+
+const SuggestionRow = memo(function SuggestionRow({ suggestion, edgeId, active, onFocus }: {
+  suggestion: SuggestedRelationship;
+  edgeId: string;
+  active: boolean;
+  onFocus: ReferencesPanelProps["onFocus"];
+}) {
+  return (
+    <button
+      type="button"
+      className={`lg-reference is-suggestion ${active ? "is-active" : ""}`}
+      onMouseEnter={() => onFocus({ edgeId })}
+      onMouseLeave={() => onFocus(EMPTY_FOCUS)}
+    >
+      <span className="lg-relation-badge">Suggestion{suggestion.score !== undefined ? ` · ${Math.round(suggestion.score * 100)}%` : ""}</span>
+      <span className="lg-reference-context">{suggestion.reason ?? "Suggested relationship"}</span>
+    </button>
+  );
+});
+
+const ReferenceSection = memo(function ReferenceSection({
   title,
+  direction,
   items,
   model,
   focus,
@@ -38,6 +80,7 @@ function ReferenceSection({
   onNavigate
 }: {
   title: string;
+  direction: "outgoing" | "incoming";
   items: ProjectedOccurrence[];
   model: GraphModel;
   focus: InteractionFocus;
@@ -47,17 +90,16 @@ function ReferenceSection({
 }) {
   const [limit, setLimit] = useState(120);
   useEffect(() => setLimit(120), [model]);
-  const visibleItems = items.slice(0, limit);
   const groups = useMemo(() => {
     const grouped = new Map<string, ProjectedOccurrence[]>();
-    for (const item of visibleItems) {
+    for (const item of items.slice(0, limit)) {
       const label = neighborFor(model, item);
       const group = grouped.get(label) ?? [];
       group.push(item);
       grouped.set(label, group);
     }
     return [...grouped.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [visibleItems, model]);
+  }, [items, limit, model]);
 
   return (
     <section className="lg-reference-section">
@@ -68,21 +110,18 @@ function ReferenceSection({
           <div className="lg-reference-group-title"><span>{label}</span><b>{entries.length}</b></div>
           {entries.map((item) => {
             const edge = edgeByOccurrence.get(item.occurrence.id);
-            const direction = referenceDirection(model, item);
-            const active = focus.occurrenceId === item.occurrence.id || focus.edgeId === edge?.id ||
-              (focus.nodeId && (focus.nodeId === item.sourceNodeId || focus.nodeId === item.targetNodeId));
+            const active = focus.occurrenceId === item.occurrence.id || (edge !== undefined && focus.edgeId === edge.id) ||
+              focus.nodeId === item.sourceNodeId || focus.nodeId === item.targetNodeId;
             return (
-              <button
-                type="button"
-                className={`lg-reference ${active ? "is-active" : ""}`}
+              <ReferenceRow
                 key={item.occurrence.id}
-                onMouseEnter={() => onFocus({ occurrenceId: item.occurrence.id, edgeId: edge?.id })}
-                onMouseLeave={() => onFocus({})}
-                onClick={() => onNavigate(item, direction)}
-              >
-                <span className={`lg-relation-badge is-${item.occurrence.kind}`}>{TYPE_LABEL[item.occurrence.kind]}</span>
-                <span className="lg-reference-context">{item.occurrence.sourceContext || "Open exact occurrence"}</span>
-              </button>
+                item={item}
+                edgeId={edge?.id}
+                direction={direction}
+                active={active}
+                onFocus={onFocus}
+                onNavigate={onNavigate}
+              />
             );
           })}
         </div>
@@ -94,15 +133,19 @@ function ReferenceSection({
       )}
     </section>
   );
-}
+});
 
-export function ReferencesPanel({ model, focus, onFocus, onNavigate }: ReferencesPanelProps) {
-  const { actual, outgoing, incoming, suggestions, edgeByOccurrence } = useMemo(() => {
+export const ReferencesPanel = memo(function ReferencesPanel({ model, focus, onFocus, onNavigate }: ReferencesPanelProps) {
+  const { actual, outgoing, incoming, suggestions, suggestionCount, edgeByOccurrence } = useMemo(() => {
     const actualItems = [...model.occurrences.values()];
     const edgeIndex = new Map<string, VisualEdge>();
     const suggestedEdges: VisualEdge[] = [];
+    let suggestionCount = 0;
     for (const edge of model.edges.values()) {
-      if (edge.suggested) suggestedEdges.push(edge);
+      if (edge.suggested) {
+        suggestedEdges.push(edge);
+        suggestionCount += edge.suggestions.length;
+      }
       for (const item of edge.actualOccurrences) edgeIndex.set(item.occurrence.id, edge);
     }
     return {
@@ -110,6 +153,7 @@ export function ReferencesPanel({ model, focus, onFocus, onNavigate }: Reference
       outgoing: actualItems.filter((item) => referenceDirection(model, item) === "outgoing"),
       incoming: actualItems.filter((item) => referenceDirection(model, item) === "incoming"),
       suggestions: suggestedEdges,
+      suggestionCount,
       edgeByOccurrence: edgeIndex
     };
   }, [model]);
@@ -117,31 +161,28 @@ export function ReferencesPanel({ model, focus, onFocus, onNavigate }: Reference
     <aside className="lg-references">
       <div className="lg-references-heading">
         <span>References</span>
-        <b>{actual.length + suggestions.reduce((total, edge) => total + edge.suggestions.length, 0)}</b>
+        <b>{actual.length + suggestionCount}</b>
       </div>
       <div className="lg-references-scroll">
-        <ReferenceSection title="Outgoing" items={outgoing} model={model} focus={focus} edgeByOccurrence={edgeByOccurrence} onFocus={onFocus} onNavigate={onNavigate} />
-        <ReferenceSection title="Incoming" items={incoming} model={model} focus={focus} edgeByOccurrence={edgeByOccurrence} onFocus={onFocus} onNavigate={onNavigate} />
+        <ReferenceSection title="Outgoing" direction="outgoing" items={outgoing} model={model} focus={focus} edgeByOccurrence={edgeByOccurrence} onFocus={onFocus} onNavigate={onNavigate} />
+        <ReferenceSection title="Incoming" direction="incoming" items={incoming} model={model} focus={focus} edgeByOccurrence={edgeByOccurrence} onFocus={onFocus} onNavigate={onNavigate} />
         <section className="lg-reference-section">
-          <h3>Suggested<span>{suggestions.reduce((total, edge) => total + edge.suggestions.length, 0)}</span></h3>
+          <h3>Suggested<span>{suggestionCount}</span></h3>
           {suggestions.length === 0 && <p className="lg-empty-small">No visible suggestions</p>}
           {suggestions.flatMap((edge) => edge.suggestions.map((suggestion) => {
             const active = focus.edgeId === edge.id;
             return (
-              <button
-                type="button"
-                className={`lg-reference is-suggestion ${active ? "is-active" : ""}`}
+              <SuggestionRow
                 key={suggestion.id}
-                onMouseEnter={() => onFocus({ edgeId: edge.id })}
-                onMouseLeave={() => onFocus({})}
-              >
-                <span className="lg-relation-badge">Suggestion{suggestion.score !== undefined ? ` · ${Math.round(suggestion.score * 100)}%` : ""}</span>
-                <span className="lg-reference-context">{suggestion.reason ?? "Suggested relationship"}</span>
-              </button>
+                suggestion={suggestion}
+                edgeId={edge.id}
+                active={active}
+                onFocus={onFocus}
+              />
             );
           }))}
         </section>
       </div>
     </aside>
   );
-}
+});
